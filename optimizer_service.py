@@ -1,150 +1,192 @@
 # optimizer_service.py
+from __future__ import annotations
 
-from typing import List, Dict, Any
-import pandas as pd
+from typing import Dict, List, Any
+
 import pyomo.environ as pyo
 
 from matriz_rutas import compute_matrix
 from generar_rutas import generar_rutas
 from rutas_cg import (
-    build_rmp, all_candidate_routes, pricing_dual_rc, get_solver
+    get_solver,
+    all_candidate_routes,
+    build_rmp,
+    pricing_dual_rc,
 )
 
 
-def solve_routing(
-    plant_address: str,
+def build_data_from_inputs(
     clients: List[Dict[str, Any]],
-    truck_types: Dict[str, Dict[str, float]],
-    route_params: Dict[str, Any],
-    api_key: str,
-) -> Dict[str, Any]:
-    """
-    Ejecuta TODO el pipeline:
-      - Matriz de distancias/tiempos (Google Routes API)
-      - Generación de rutas (planta -> clientes)
-      - Construcción de I,J,F,Q,d,C_route
-      - Column Generation + MIP final
-
-    Entradas:
-      plant_address: dirección de la planta.
-      clients: lista de dicts con:
-          { "id": "C1", "name": "...", "address": "...", "demand_tons": 15.0 }
-      truck_types: ej:
-          {
-            "T30": {"capacity_tons": 30.0, "fixed_cost": 800.0, "count": 5},
-            "T10": {"capacity_tons": 10.0, "fixed_cost": 300.0, "count": 3},
-          }
-      route_params:
-          {
-            "max_clientes_por_ruta": 3,
-            "t_max_min": 180,
-            "costo_por_km": 10.0,
-            "costo_por_min": 5.0,
-          }
-      api_key: API key de Google
-
-    Devuelve:
-      dict con resultado de la relajación LP y del MIP final.
-    """
-
-    # 1) Direcciones y IDs de clientes
-    addresses = [plant_address] + [c["address"] for c in clients]
-    client_ids = [c["id"] for c in clients]
-
-    # 2) Google Routes API -> matrices
-    df_D, df_T = compute_matrix(addresses, api_key)
-    # compute_matrix normalmente también guarda distancias_km.csv y tiempos_min.csv
-    # y generamos rutas usando esos CSV para mantener compatibilidad.
-
-    # 3) Generar rutas físicas (planta -> secuencia de clientes)
-    df_routes = generar_rutas(
-        dist_file="distancias_km.csv",
-        time_file="tiempos_min.csv",
-        addresses=addresses,
-        client_ids=client_ids,
-        max_clientes_por_ruta=route_params["max_clientes_por_ruta"],
-        t_max_min=route_params["t_max_min"],
-        costo_por_km=route_params["costo_por_km"],
-        costo_por_min=route_params["costo_por_min"],
-        output_file="rutas_generadas.csv",
-    )
-
-    # 4) Construir I,J,F,Q,d,C_route en memoria
-    I, J, F, Q, d, C_route = build_data_in_memory(clients, truck_types, df_routes)
-
-    # 5) Column Generation
-    result_lp, current_columns = solve_with_column_generation(
-        I, J, F, Q, d, C_route,
-        max_clientes_por_ruta=route_params["max_clientes_por_ruta"]
-    )
-
-    # 6) MIP final
-    mip_solution = solve_mip_final(I, J, F, Q, d, C_route, current_columns)
-
-    return {
-        "lp_relaxation": result_lp,
-        "mip_solution": mip_solution,
-    }
-
-
-def build_data_in_memory(
-    clients: List[Dict[str, Any]],
-    truck_types: Dict[str, Dict[str, float]],
-    df_routes: pd.DataFrame,
+    truck_types: Dict[str, Dict[str, Any]],
+    rutas_file: str,
+    demand_min: float = 0.0,
+    demand_max: float = 1e9,
 ):
-    """Versión en memoria de build_data_from_real."""
-    # ---- clientes y demandas
-    J = [c["id"] for c in clients]
-    d = {c["id"]: float(c["demand_tons"]) for c in clients}
+    """
+    Construye I, J, F, Q, d, C_route a partir de:
+      - clients: lista de dicts {id, name, address, demand_tons}
+      - truck_types: dict {'T1': {...}, 'T2': {...}}
+      - rutas_file: CSV generado por generar_rutas.py
 
-    # ---- flota de camiones
-    I = []
-    Q = {}
-    F = {}
+    d[j]: demanda por cliente
+    I:   camiones (tipo_k) por ID individual
+    Q[i]: capacidad de camión i
+    F[i]: costo fijo de camión i
+    C_route[S]: mejor costo variable de una ruta que atiende exactamente S
+    """
+    import pandas as pd
+
+    # --- clientes y demandas ---
+    J: List[str] = [c["id"] for c in clients]
+    d: Dict[str, float] = {}
+    for c in clients:
+        cid = c["id"]
+        dj = float(c["demand_tons"])
+        if dj < demand_min or dj > demand_max:
+            raise ValueError(
+                f"Demanda del cliente {cid} = {dj} fuera de rango "
+                f"[{demand_min}, {demand_max}]"
+            )
+        d[cid] = dj
+
+    # --- flota de camiones ---
+    I: List[str] = []
+    Q: Dict[str, float] = {}
+    F: Dict[str, float] = {}
     for tname, info in truck_types.items():
         cap = float(info["capacity_tons"])
         fix = float(info["fixed_cost"])
         count = int(info["count"])
         for k in range(count):
-            i_id = f"{tname}_{k+1}"
+            i_id = f"{tname}_{k + 1}"
             I.append(i_id)
             Q[i_id] = cap
             F[i_id] = fix
 
-    # ---- construir C_route[S] desde df_routes
+    # --- rutas generadas ---
+    df_routes = pd.read_csv(rutas_file)
     C_route: Dict[frozenset, float] = {}
+
     for _, row in df_routes.iterrows():
-        clientes_str = str(row["clientes_ids"]).strip()
-        if not clientes_str:
+        ids_str = row.get("clientes_ids", "")
+        if not isinstance(ids_str, str) or not ids_str.strip():
             continue
-        S_ids = tuple(sorted(clientes_str.split(",")))
-        S = frozenset(S_ids)
-        costo_var = float(row["costo_ruta"])
-
-        total_load = sum(d[j] for j in S_ids)
-        max_cap = max(Q.values())
-        if total_load > max_cap:
-            continue
-
-        if S not in C_route or costo_var < C_route[S]:
-            C_route[S] = costo_var
+        S = frozenset(ids_str.split(","))
+        cost = float(row["costo_ruta"])
+        if (S not in C_route) or (cost < C_route[S]):
+            C_route[S] = cost
 
     if not C_route:
-        raise RuntimeError("No se generó ninguna ruta factible en memoria.")
+        raise ValueError(
+            "No se generó ninguna ruta factible. "
+            "Revisa el tiempo máximo, el máximo número de clientes por ruta "
+            "o las matrices de distancias/tiempos."
+        )
 
     return I, J, F, Q, d, C_route
 
 
-def solve_with_column_generation(
-    I, J, F, Q, d, C_route, max_clientes_por_ruta: int
-):
-    """Lógica de generación de columnas (LP)."""
-    Qref = max(Q.values())
-    ALL_R = all_candidate_routes(J, C_route, d,
-                                 max_size=max_clientes_por_ruta,
-                                 Qref=Qref)
+def solve_routing(
+    plant_address: str,
+    clients: List[Dict[str, Any]],
+    truck_types: Dict[str, Dict[str, Any]],
+    route_params: Dict[str, Any],
+    api_key: str,
+) -> Dict[str, Any]:
+    """
+    Orquesta todo el flujo:
 
-    # columnas iniciales: rutas unitarias
+      1) Chequeo de capacidad total vs demanda total.
+      2) Llamada a Google Routes (compute_matrix).
+      3) Generación de rutas enumerativas (generar_rutas).
+      4) Construcción de datos para el modelo (build_data_from_inputs).
+      5) Generación de columnas + MIP final (rutas_cg).
+      6) Devuelve un diccionario con el costo óptimo y el detalle de rutas.
+    """
+    if not api_key:
+        raise ValueError("Falta la API key de Google Routes.")
+
+    if not clients:
+        raise ValueError("Debes ingresar al menos un cliente.")
+
+    # --- chequeo rápido de capacidad total ---
+    total_demand = sum(float(c["demand_tons"]) for c in clients)
+    total_capacity = 0.0
+    for info in truck_types.values():
+        cap = float(info["capacity_tons"])
+        cnt = int(info["count"])
+        total_capacity += cap * cnt
+
+    if total_capacity <= 0:
+        raise ValueError("No hay camiones disponibles en la flota.")
+
+    if total_capacity + 1e-6 < total_demand:
+        raise ValueError(
+            "No se puede satisfacer la **demanda de todos los clientes** con la flota actual.\n\n"
+            f"- Demanda total: {total_demand:.1f} t\n"
+            f"- Capacidad disponible: {total_capacity:.1f} t"
+        )
+
+    # --- parámetros de rutas ---
+    max_clients = int(route_params.get("max_clientes_por_ruta", 3))
+    t_max = float(route_params.get("t_max_min", 180.0))
+    costo_km = float(route_params.get("costo_por_km", 10.0))
+    costo_min = float(route_params.get("costo_por_min", 5.0))
+    dmin = float(route_params.get("demand_min", 0.0))
+    dmax = float(route_params.get("demand_max", 1e9))
+
+    # --- direcciones para matriz de distancias/tiempos ---
+    addresses = [plant_address] + [c["address"] for c in clients]
+    client_ids = [c["id"] for c in clients]
+
+    dist_csv = "distancias_km.csv"
+    time_csv = "tiempos_min.csv"
+    rutas_csv = "rutas_generadas.csv"
+
+    # 1) Matriz de distancias y tiempos
+    compute_matrix(addresses, api_key, output_dist=dist_csv, output_time=time_csv)
+
+    # 2) Enumeración de rutas factibles
+    generar_rutas(
+        dist_csv,
+        time_csv,
+        addresses,
+        client_ids,
+        max_clientes_por_ruta=max_clients,
+        t_max_min=t_max,
+        costo_por_km=costo_km,
+        costo_por_min=costo_min,
+        output_file=rutas_csv,
+    )
+
+    # 3) Datos para el modelo
+    I, J, F, Q, d, C_route = build_data_from_inputs(
+        clients=clients,
+        truck_types=truck_types,
+        rutas_file=rutas_csv,
+        demand_min=dmin,
+        demand_max=dmax,
+    )
+
+    # 3.1) Verificar que cada cliente aparezca en al menos una ruta candidata
+    Qref = max(Q.values()) if Q else 0.0
+    ALL_R = all_candidate_routes(
+        J, C_route, d, max_size=max_clients, Qref=Qref
+    )
+
+    uncovered = [k for k in J if not any(k in S for S in ALL_R)]
+    if uncovered:
+        raise ValueError(
+            "Con la configuración actual NO existe ninguna ruta factible que visite:\n  - "
+            + "\n  - ".join(uncovered)
+            + "\n\nRevisa el tiempo máximo por ruta, el máximo de clientes por ruta o las matrices de distancias/tiempos."
+        )
+
+    # 4) Generación de columnas + MIP final
+    solver = get_solver()
+    TOL = 1e-9
+
+    # 4.1) Columnas iniciales: rutas unitarias (cada camión a un solo cliente)
     current_columns = []
     for i in I:
         for j in J:
@@ -152,58 +194,77 @@ def solve_with_column_generation(
             if S in C_route:
                 current_columns.append((i, S))
 
-    solver = get_solver()
-    it = 0
-    TOL = 1e-9
+    if not current_columns:
+        raise ValueError(
+            "No se encontraron rutas unitarias planta→cliente factibles. "
+            "Revisa restricciones de tiempo y distancias."
+        )
 
+    it = 0
     while True:
         rmp = build_rmp(I, J, Q, F, d, C_route, current_columns, binary=False)
         solver.solve(rmp, tee=False)
 
-        beta  = {i: rmp.dual[rmp.slot[i]]  for i in I}
-        alpha = {i: rmp.dual[rmp.cap[i]]   for i in I}
-        pi    = {k: rmp.dual[rmp.cover[k]] for k in J}
-        zLP   = pyo.value(rmp.OBJ)
+        beta = {i: rmp.dual[rmp.slot[i]] for i in I}
+        alpha = {i: rmp.dual[rmp.cap[i]] for i in I}
+        pi = {k: rmp.dual[rmp.cover[k]] for k in J}
 
         curr_set = set(current_columns)
-        rc_list = pricing_dual_rc(I, ALL_R, F, d, C_route,
-                                  betas=beta, alphas=alpha, pis=pi,
-                                  current_columns_set=curr_set)
+        rc_list = pricing_dual_rc(
+            I, ALL_R, F, d, C_route, beta, alpha, pi, curr_set
+        )
 
-        added = False
+        nneg = sum(1 for rc, _ in rc_list if rc < -TOL)
+        if nneg == 0:
+            # Óptimo LP alcanzado (no hay columnas con rc<0)
+            break
+
         for rc, (i, S_tuple) in rc_list:
             if rc < -TOL:
                 current_columns.append((i, frozenset(S_tuple)))
-                added = True
-        if not added:
-            break
+
         it += 1
+        if it > 50:  # tope de seguridad
+            break
 
-    return {"zLP": zLP, "iterations": it}, current_columns
-
-
-def solve_mip_final(I, J, F, Q, d, C_route, current_columns):
-    """Resuelve el MIP binario final y devuelve asignación como lista de dicts."""
-    solver = get_solver()
+    # 5) MIP final (x binaria)
     mip = build_rmp(I, J, Q, F, d, C_route, current_columns, binary=True)
     solver.solve(mip, tee=False)
 
-    z_star = pyo.value(mip.OBJ)
-    solution_rows = []
-    for c in mip.COL:
-        if pyo.value(mip.x[c]) > 0.5:
-            i = mip.col_i[c]
-            S = tuple(sorted(mip.col_S[c]))
-            carga = mip.col_load[c]
-            costo = mip.col_cost[c]
-            solution_rows.append({
-                "truck": i,
-                "clients": list(S),
-                "load": carga,
-                "cost": costo,
-            })
+    assignments = []
+    client_name = {c["id"]: c.get("name", c["id"]) for c in clients}
+
+    for c_idx in mip.COL:
+        if pyo.value(mip.x[c_idx]) > 0.5:
+            i = mip.col_i[c_idx]
+            S_tuple = tuple(sorted(mip.col_S[c_idx]))
+            load = float(mip.col_load[c_idx])
+            total_cost = float(mip.col_cost[c_idx])
+            S_fset = frozenset(S_tuple)
+            var_cost = float(C_route[S_fset])
+            fix_cost = float(F[i])
+
+            assignments.append(
+                {
+                    "camion": i,
+                    "tipo_camion": i.split("_")[0],  # T1, T2, ...
+                    "clientes_ids": ",".join(S_tuple),
+                    "clientes_nombres": ", ".join(
+                        client_name[k] for k in S_tuple
+                    ),
+                    "carga_t": load,
+                    "costo_fijo_S/": fix_cost,
+                    "costo_variable_S/": var_cost,
+                    "costo_total_S/": total_cost,
+                }
+            )
+
+    z_opt = float(pyo.value(mip.OBJ))
 
     return {
-        "z_star": z_star,
-        "assignments": solution_rows,
+        "objective": z_opt,
+        "assignments": assignments,
+        "total_demand": total_demand,
+        "total_capacity": total_capacity,
     }
+
