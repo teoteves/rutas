@@ -28,15 +28,20 @@ Ajusta los parámetros y haz click en **Ejecutar optimización**.
 # =======================
 st.sidebar.header("Configuración global")
 
-api_key = st.sidebar.text_input(
-    "Google Routes API Key",
-    value=st.secrets.get("GOOGLE_ROUTES_API_KEY", ""),
-    type="password",
-    help="Guárdala como secreto en Streamlit Cloud para más seguridad.",
-)
+# 1) Intentar leer la key desde secretos del servidor
+api_key = st.secrets.get("GOOGLE_ROUTES_API_KEY", None)
 
-if not api_key:
-    st.sidebar.warning("⚠️ Falta la API key de Google Routes.")
+if api_key:
+    st.sidebar.success("Google Routes API configurada en el servidor.")
+else:
+    # Solo si NO hay secreto configurado, permitimos escribirla a mano
+    api_key = st.sidebar.text_input(
+        "Google Routes API Key",
+        type="password",
+        help="Solo se usa en esta sesión; no se guarda en GitHub.",
+    )
+    if not api_key:
+        st.sidebar.warning("⚠️ Falta la API key de Google Routes.")
 
 max_clientes_por_ruta = st.sidebar.slider(
     "Máximo de clientes por ruta", min_value=1, max_value=5, value=3, step=1
