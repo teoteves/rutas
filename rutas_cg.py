@@ -302,6 +302,7 @@ def build_rmp(
     d: Dict[str, float],
     C_route: Dict[frozenset, float],
     current_columns: List[Tuple[str, frozenset]],
+    route_text_map=None,
     binary: bool = False,
 ) -> pyo.ConcreteModel:
     """
@@ -441,3 +442,4 @@ def pricing_dual_rc(
 
     out.sort(key=lambda z: z[0])
     return out
+
