@@ -156,5 +156,4 @@ T_MAX_MIN = 180   # minutos
 COSTO_POR_KM = 10.0
 COSTO_POR_MIN = 5.0
 
-# 6) API key
-API_KEY = "AIzaSyAa2sW7UqI7J1232uYJDRWfpfbtx05nnaM"
+
