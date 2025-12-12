@@ -273,7 +273,7 @@ def solve_routing(
 
     it = 0
     while True:
-        rmp = build_rmp(I, J, Q, F, d, C_route, current_columns, route_text_map, binary=False)
+        rmp = build_rmp(I, J, Q, F, d, C_route, current_columns, route_text_map=route_text_map, binary=False)
         solver.solve(rmp, tee=False)
 
         beta = {i: rmp.dual[rmp.slot[i]] for i in I}
@@ -296,7 +296,7 @@ def solve_routing(
             break
 
     # 5) MIP final (binario)
-    mip = build_rmp(I, J, Q, F, d, C_route, current_columns, route_text_map, binary=True)
+    mip = build_rmp(I, J, Q, F, d, C_route, current_columns, route_text_map=route_text_map, binary=True)
     solver.solve(mip, tee=False)
 
     assignments = []
