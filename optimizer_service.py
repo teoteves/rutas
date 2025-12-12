@@ -1,8 +1,9 @@
-# optimizer_service.py
 from __future__ import annotations
 
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Iterable, Tuple
+import math
 
+import pandas as pd
 import pyomo.environ as pyo
 
 from matriz_rutas import compute_matrix
@@ -15,6 +16,63 @@ from rutas_cg import (
 )
 
 
+# ----------------------------------------------------
+# Auxiliar: recomendación mínima de camiones por tipo
+# ----------------------------------------------------
+def recomendar_camiones_minimos(
+    demanda_total: float,
+    capacidades: Dict[str, float],
+) -> Dict[str, int]:
+    """
+    Dado:
+      - demanda_total D
+      - capacidades: dict {tipo: Q_t} con Q_t > 0
+
+    Devuelve un dict {tipo: n_t} con el número mínimo de camiones de cada tipo
+    para que sum_t Q_t * n_t >= D, minimizando sum_t n_t.
+
+    Implementado para 1 o 2 tipos (caso actual).
+    """
+    tipos_positivos = [(t, float(Q)) for t, Q in capacidades.items() if Q > 0]
+
+    if not tipos_positivos or demanda_total <= 0:
+        return {t: 0 for t in capacidades.keys()}
+
+    # Caso: un solo tipo
+    if len(tipos_positivos) == 1:
+        t, Q = tipos_positivos[0]
+        n = math.ceil(demanda_total / Q)
+        return {t: n}
+
+    # Caso: dos tipos
+    (t1, Q1), (t2, Q2) = tipos_positivos[:2]
+    if Q2 > Q1:
+        (t1, Q1), (t2, Q2) = (t2, Q2), (t1, Q1)
+
+    mejor_n1 = mejor_n2 = None
+    mejor_total = None
+    max_n1 = math.ceil(demanda_total / Q1)
+
+    for n1 in range(max_n1 + 1):
+        restante = demanda_total - n1 * Q1
+        if restante <= 0:
+            n2 = 0
+        else:
+            n2 = math.ceil(restante / Q2)
+        total_camiones = n1 + n2
+        if total_camiones == 0 and demanda_total > 0:
+            continue
+        if (mejor_total is None) or (total_camiones < mejor_total):
+            mejor_total = total_camiones
+            mejor_n1 = n1
+            mejor_n2 = n2
+
+    return {t1: mejor_n1, t2: mejor_n2}
+
+
+# ----------------------------------------------------
+# Construcción de datos desde inputs de la app
+# ----------------------------------------------------
 def build_data_from_inputs(
     clients: List[Dict[str, Any]],
     truck_types: Dict[str, Dict[str, Any]],
@@ -23,19 +81,11 @@ def build_data_from_inputs(
     demand_max: float = 1e9,
 ):
     """
-    Construye I, J, F, Q, d, C_route a partir de:
+    Construye I, J, F, Q, d, C_route, route_text_map a partir de:
       - clients: lista de dicts {id, name, address, demand_tons}
       - truck_types: dict {'T1': {...}, 'T2': {...}}
       - rutas_file: CSV generado por generar_rutas.py
-
-    d[j]: demanda por cliente
-    I:   camiones (tipo_k) por ID individual
-    Q[i]: capacidad de camión i
-    F[i]: costo fijo de camión i
-    C_route[S]: mejor costo variable de una ruta que atiende exactamente S
     """
-    import pandas as pd
-
     # --- clientes y demandas ---
     J: List[str] = [c["id"] for c in clients]
     d: Dict[str, float] = {}
@@ -58,34 +108,51 @@ def build_data_from_inputs(
         fix = float(info["fixed_cost"])
         count = int(info["count"])
         for k in range(count):
-            i_id = f"{tname}_{k + 1}"
+            i_id = f"{tname}_{k+1}"
             I.append(i_id)
             Q[i_id] = cap
             F[i_id] = fix
 
-    # --- rutas generadas ---
     df_routes = pd.read_csv(rutas_file)
+
     C_route: Dict[frozenset, float] = {}
+    route_text_map: Dict[frozenset, str] = {}
 
     for _, row in df_routes.iterrows():
-        ids_str = row.get("clientes_ids", "")
-        if not isinstance(ids_str, str) or not ids_str.strip():
+        clientes_str = str(row["clientes_ids"]).strip()
+        if not clientes_str:
             continue
-        S = frozenset(ids_str.split(","))
-        cost = float(row["costo_ruta"])
-        if (S not in C_route) or (cost < C_route[S]):
-            C_route[S] = cost
+        # Orden de visita de los clientes en la ruta física
+        S_ids_order = clientes_str.split(",")
+        # Conjunto lógico (ignora el orden)
+        S_ids_sorted = tuple(sorted(S_ids_order))
+        S = frozenset(S_ids_sorted)
+        costo_var = float(row["costo_ruta"])
+
+        total_load = sum(d[j] for j in S_ids_sorted)
+        max_cap = max(Q.values())
+        if total_load > max_cap:
+            continue
+
+        if S not in C_route or costo_var < C_route[S]:
+            C_route[S] = costo_var
+            # Texto de ruta en IDs (en la app mostramos siempre "Planta" al inicio)
+            ruta_ids = " -> ".join(S_ids_order)
+            route_text_map[S] = f"Planta -> {ruta_ids}"
 
     if not C_route:
         raise ValueError(
             "No se generó ninguna ruta factible. "
-            "Revisa el tiempo máximo, el máximo número de clientes por ruta "
+            "Revisa el tiempo máximo por ruta, el máximo de clientes por ruta "
             "o las matrices de distancias/tiempos."
         )
 
-    return I, J, F, Q, d, C_route
+    return I, J, F, Q, d, C_route, route_text_map
 
 
+# ----------------------------------------------------
+# Flujo principal para la app
+# ----------------------------------------------------
 def solve_routing(
     plant_address: str,
     clients: List[Dict[str, Any]],
@@ -94,14 +161,7 @@ def solve_routing(
     api_key: str,
 ) -> Dict[str, Any]:
     """
-    Orquesta todo el flujo:
-
-      1) Chequeo de capacidad total vs demanda total.
-      2) Llamada a Google Routes (compute_matrix).
-      3) Generación de rutas enumerativas (generar_rutas).
-      4) Construcción de datos para el modelo (build_data_from_inputs).
-      5) Generación de columnas + MIP final (rutas_cg).
-      6) Devuelve un diccionario con el costo óptimo y el detalle de rutas.
+    Orquesta todo el flujo para la app Streamlit.
     """
     if not api_key:
         raise ValueError("Falta la API key de Google Routes.")
@@ -110,22 +170,35 @@ def solve_routing(
         raise ValueError("Debes ingresar al menos un cliente.")
 
     # --- chequeo rápido de capacidad total ---
-    total_demand = sum(float(c["demand_tons"]) for c in clients)
-    total_capacity = 0.0
-    for info in truck_types.values():
-        cap = float(info["capacity_tons"])
-        cnt = int(info["count"])
-        total_capacity += cap * cnt
+    demanda_total = sum(float(c["demand_tons"]) for c in clients)
 
-    if total_capacity <= 0:
+    capacidades = {t: float(info["capacity_tons"]) for t, info in truck_types.items()}
+    conteo_actual = {t: int(info["count"]) for t, info in truck_types.items()}
+    capacidad_total = sum(
+        capacidades[t] * conteo_actual[t] for t in capacidades.keys()
+    )
+
+    if capacidad_total <= 0:
         raise ValueError("No hay camiones disponibles en la flota.")
 
-    if total_capacity + 1e-6 < total_demand:
-        raise ValueError(
-            "No se puede satisfacer la **demanda de todos los clientes** con la flota actual.\n\n"
-            f"- Demanda total: {total_demand:.1f} t\n"
-            f"- Capacidad disponible: {total_capacity:.1f} t"
-        )
+    if capacidad_total + 1e-6 < demanda_total:
+        recomendados = recomendar_camiones_minimos(demanda_total, capacidades)
+        msg_lines = [
+            "No se puede satisfacer la **demanda de todos los clientes** con la flota actual.",
+            "",
+            f"- Demanda total: {demanda_total:.1f} t",
+            f"- Capacidad disponible actual: {capacidad_total:.1f} t",
+            "",
+            "Recomendación mínima de camiones (solo por capacidad, ignorando límites actuales):",
+        ]
+        for t, n in recomendados.items():
+            msg_lines.append(f"  · Tipo {t}: {n} camión(es) de {capacidades[t]:.1f} t")
+
+        msg_lines.append("")
+        msg_lines.append("Flota actual declarada:")
+        for t, c in conteo_actual.items():
+            msg_lines.append(f"  · Tipo {t}: {c} camión(es)")
+        raise ValueError("\n".join(msg_lines))
 
     # --- parámetros de rutas ---
     max_clients = int(route_params.get("max_clientes_por_ruta", 3))
@@ -143,7 +216,7 @@ def solve_routing(
     time_csv = "tiempos_min.csv"
     rutas_csv = "rutas_generadas.csv"
 
-    # 1) Matriz de distancias y tiempos
+    # 1) Matriz de distancias y tiempos (escribe CSVs)
     compute_matrix(addresses, api_key, output_dist=dist_csv, output_time=time_csv)
 
     # 2) Enumeración de rutas factibles
@@ -160,7 +233,7 @@ def solve_routing(
     )
 
     # 3) Datos para el modelo
-    I, J, F, Q, d, C_route = build_data_from_inputs(
+    I, J, F, Q, d, C_route, route_text_map = build_data_from_inputs(
         clients=clients,
         truck_types=truck_types,
         rutas_file=rutas_csv,
@@ -168,26 +241,24 @@ def solve_routing(
         demand_max=dmax,
     )
 
-    # 3.1) Verificar que cada cliente aparezca en al menos una ruta candidata
+    # 3.1) Verificar que cada cliente aparezca en alguna ruta candidata
     Qref = max(Q.values()) if Q else 0.0
-    ALL_R = all_candidate_routes(
-        J, C_route, d, max_size=max_clients, Qref=Qref
-    )
+    ALL_R = all_candidate_routes(J, C_route, d, max_size=max_clients, Qref=Qref)
 
     uncovered = [k for k in J if not any(k in S for S in ALL_R)]
     if uncovered:
         raise ValueError(
             "Con la configuración actual NO existe ninguna ruta factible que visite:\n  - "
             + "\n  - ".join(uncovered)
-            + "\n\nRevisa el tiempo máximo por ruta, el máximo de clientes por ruta o las matrices de distancias/tiempos."
+            + "\n\nRevisa el tiempo máximo por ruta, el máximo de clientes por ruta "
+            "o las matrices de distancias/tiempos."
         )
 
-    # 4) Generación de columnas + MIP final
+    # 4) Generación de columnas (LP)
     solver = get_solver()
     TOL = 1e-9
 
-    # 4.1) Columnas iniciales: rutas unitarias (cada camión a un solo cliente)
-    current_columns = []
+    current_columns: List[Tuple[str, frozenset]] = []
     for i in I:
         for j in J:
             S = frozenset([j])
@@ -197,38 +268,35 @@ def solve_routing(
     if not current_columns:
         raise ValueError(
             "No se encontraron rutas unitarias planta→cliente factibles. "
-            "Revisa restricciones de tiempo y distancias."
+            "Revisa las restricciones de rutas."
         )
 
     it = 0
     while True:
-        rmp = build_rmp(I, J, Q, F, d, C_route, current_columns, binary=False)
+        rmp = build_rmp(I, J, Q, F, d, C_route, current_columns, route_text_map, binary=False)
         solver.solve(rmp, tee=False)
 
         beta = {i: rmp.dual[rmp.slot[i]] for i in I}
         alpha = {i: rmp.dual[rmp.cap[i]] for i in I}
-        pi = {k: rmp.dual[rmp.cover[k]] for k in J}
+        pi_dual = {k: rmp.dual[rmp.cover[k]] for k in J}
 
         curr_set = set(current_columns)
-        rc_list = pricing_dual_rc(
-            I, ALL_R, F, d, C_route, beta, alpha, pi, curr_set
-        )
+        rc_list = pricing_dual_rc(I, ALL_R, F, d, C_route, beta, alpha, pi_dual, curr_set)
 
         nneg = sum(1 for rc, _ in rc_list if rc < -TOL)
         if nneg == 0:
-            # Óptimo LP alcanzado (no hay columnas con rc<0)
             break
 
-        for rc, (i, S_tuple) in rc_list:
+        for rc, (i_col, S_tuple) in rc_list:
             if rc < -TOL:
-                current_columns.append((i, frozenset(S_tuple)))
+                current_columns.append((i_col, frozenset(S_tuple)))
 
         it += 1
-        if it > 50:  # tope de seguridad
+        if it > 50:  # por seguridad
             break
 
-    # 5) MIP final (x binaria)
-    mip = build_rmp(I, J, Q, F, d, C_route, current_columns, binary=True)
+    # 5) MIP final (binario)
+    mip = build_rmp(I, J, Q, F, d, C_route, current_columns, route_text_map, binary=True)
     solver.solve(mip, tee=False)
 
     assignments = []
@@ -236,22 +304,28 @@ def solve_routing(
 
     for c_idx in mip.COL:
         if pyo.value(mip.x[c_idx]) > 0.5:
-            i = mip.col_i[c_idx]
+            i_col = mip.col_i[c_idx]
             S_tuple = tuple(sorted(mip.col_S[c_idx]))
             load = float(mip.col_load[c_idx])
             total_cost = float(mip.col_cost[c_idx])
             S_fset = frozenset(S_tuple)
             var_cost = float(C_route[S_fset])
-            fix_cost = float(F[i])
+            # Fijo según camión
+            tipo_camion = i_col.split("_")[0]
+            fix_cost = float(F[i_col])
+
+            ruta_ids_txt = "Planta -> " + " -> ".join(S_tuple)
+            ruta_txt = ruta_ids_txt
+            if route_text_map and S_fset in route_text_map:
+                ruta_txt = route_text_map[S_fset]
 
             assignments.append(
                 {
-                    "camion": i,
-                    "tipo_camion": i.split("_")[0],  # T1, T2, ...
+                    "camion": i_col,
+                    "tipo_camion": tipo_camion,
+                    "ruta_ids": ruta_txt,
                     "clientes_ids": ",".join(S_tuple),
-                    "clientes_nombres": ", ".join(
-                        client_name[k] for k in S_tuple
-                    ),
+                    "clientes_nombres": ", ".join(client_name[k] for k in S_tuple),
                     "carga_t": load,
                     "costo_fijo_S/": fix_cost,
                     "costo_variable_S/": var_cost,
@@ -264,7 +338,6 @@ def solve_routing(
     return {
         "objective": z_opt,
         "assignments": assignments,
-        "total_demand": total_demand,
-        "total_capacity": total_capacity,
+        "total_demand": demanda_total,
+        "total_capacity": capacidad_total,
     }
-
